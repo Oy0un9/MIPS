@@ -110,6 +110,7 @@ binwalk -Me firmware.bin
 模拟器
 ```C
 sudo apt-get install qemu
+apt-get install qemu binfmt-support qemu-user-static
 ```
 运行
 ```C
@@ -177,7 +178,6 @@ int main(int argc,char *argv[])
 ```
 静态编译生成二进制文件`mips-linux-gcc -o hello hello.c -static`，使用`file`查看文件类型，最终使用`qemu-mipsel hello "hello world"`测试程序。如若输出，完成安装。
 
-
 ## 第四章 路由器web漏洞
 xss利用站点内的信任用户，跨站攻击是指入侵者在远程web页面的HTML页面中插入具有恶意代码的数据，用户认为该页面是可信赖的，但是当浏览器下载该页面时，嵌入其中的脚本将被解释执行。
 
@@ -234,9 +234,40 @@ Squashfs是一个只读格式的文件系统，具有超高压缩率，可达34%
 手动提取文件系统类型包括：
 
 1. 使用`file`命令查看文件系统类型。
-2. 手动判断文件类型，包含如下步骤：
+2. 手动判断文件类型，包含如下步骤："strings|grep"检索文件系统magic签名头；“hexdump|grep”检索magic签名偏移；“dd|file”确定magic签名偏移处的文件类型。
+3. 手动提取文件系统。：安装工具，`sudo apt-get install squashfs-tools`该工具目前仅支持GZIP、LZO、XZ（LZMA2）不支持LZMA格式。可以使用firmware-mod-kit解压缩，解压后得到所有文件。安装命令：
+```C
+git clone https://github.com/mirror/firmware-mod-kit.git
+sudo apt-get install git build-essential zlib1g-dev liblzma-dev python-magic
+cd firmware-mod-kit
+./configure && make
+```
 
+### 自动提取文件系统
 
+binwalk是路由器固件分析的必备工具，该工具最大的优点是可以自动完成指令文件的扫描，智能发掘潜藏在文件中所有可疑地文件类型及文件系统。
+
+binwalk&&libmagic
+
+binwalk提取与分析过程：
+
+1. 固件扫描。通过扫描binwalk可发现目标文件中包含的所有可识别文件类型。
+```C
+binwaklk firmware.bin
+```
+2. 提取文件。选项“-e”和“--extract”用于按照预定义的配置文件中的提取方法从固件中提取探测到的文件及系统。选项“-M”，用于递归扫描。“-d”用于递归深度的限制。
+```C
+binwaklk -e firmware.bin
+```
+3. 显示完整的扫描结果。选项“-I”或“--invalid”用于显示扫描的所有结果。
+4. 指令系统分析。选项“-A”和“--opcode”用于扫描指定文件中通用cpu架构的可执行代码。
+```C
+binwaklk -A 70|more
+```
+
+通常binwalk可对绝大多数路由器固件进行文件提取，如遇到无法识别的固件，可向binwalk添加下列提取规则和提取方法，实现对新的文件系统进行扫描和提取：
+1. 基于magic签名文件自动提取。
+2. 基于binwalk配置文件的提取。
 ## 第九章 漏洞分析简介
 
 漏洞分析是指在代码中迅速定位漏洞，弄清攻击原理，准确地估计潜在的漏洞利用方式和风险等级的过程。
@@ -252,4 +283,51 @@ Squashfs是一个只读格式的文件系统，具有超高压缩率，可达34%
 ### 漏洞介绍
 
 ### 漏洞分析
-下载固件：
+下载固件: google 搜索DIR-815_FIRMWARE_1.01.ZIP。或者去官方链接下载`ftp://ftp2.dlink.com/PRODUCTS/DIR-815/REVA/DIR-815_FIRMWARE_1.01.zip`。解压缩得到固件`DIR-815 FW 1.01b14_1.01b14.bin`。
+
+使用binwalk将固件中的文件系统提取出来。
+```C 
+binwalk -Me "DIR-815 FW 1.01b14_1.01b14.bin"
+```
+该漏洞的核心组件为`/htdocs/web/hedwig.cgi`。该组件是一个指向`/htdocs/cgibin`的符号链接。
+
+将`/htdocs/cgibin`拖到IDA里面，漏洞公告中描述漏洞产生的原因是Cookie的值`过长`，CGI脚本中一般是通过`char *getenv("HTTP_COOKIE")`来获取cookie值，因此可在IDA中搜索字符串`"HTTP_COOKIE"`查看它的交叉引用，看是否可以找到关键函数。
+
+看到该字符串只有一个函数引用，该函数为`sess_get_uid`，看该区域代码为：
+```C
+lui     $a0, 0x42
+la      $t9, getenv
+la      $a0, aHttpCookie  # "HTTP_COOKIE"
+jalr    $t9 ; getenv
+```
+确实是`char *getenv("HTTP_COOKIE")`函数调用的汇编代码。再查看`sess_get_uid`函数的交叉引用，看到该函数再`hedwigcgi_main+1C0`以及`hedwigcgi_main+1C8`处有引用。跟踪到`hedwigcgi_main+1C0`的位置，看到地址`0x409680`处有个危险函数`sprintf`函数的引用，初步判断这个地方可能为栈溢出发生的地方。
+
+cookie的形式为`uid=payload`才会被程序接受，为了验证是否是`0x409680`处的地址造成该溢出漏洞，采用动态调试进行验证。
+```bash
+# cgi_run.sh
+# sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid=1234&password='+'A'*600"`
+
+INPUT="$1"
+TEST="$2"
+LEN=$(echo -n "$INPUT" | wc -c)
+PORT="1234"
+if [ "$LEN" == "0" ] || [ "$INPUT" == "-h" ] || [ "$UID" != "0" ]
+then
+    echo -e "\nusage: sudo $0\n"
+    exit 1
+fi
+cp $(which qemu-mipsel) ./qemu
+
+echo "$INPUT" | chroot . ./qemu -E CONTENT_LENGTH=$LEN -E CONTENT_TYPE="application/x-www-form-urlencodede" -E SCRIPT_NAME="common" -E REQUEST_METHOD="POST" -E HTTP_COOKIE=$TEST -E REQUEST_URI="/hedwig.cgi" -E REMOTE_ADDR="192.168.1.1" -g $PORT `/htdocs/web/hedwig.cgi` 2>/dev/null
+echo "run ok"
+rm -f ./qemu
+```
+
+调试步骤：
+
+1. 使用以下命令运行`cgi_run.sh`，此时qemu运行hedwig.cgi，并等待gdb连接到端口1234
+``` 
+sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid=1234&password='+'A'*600"`
+```
+2. gdb-multiarch调试hedwig.cgi，并在可疑地址`0x409680`处以及调用获取uid的地址`0x409648`处下断。
+3. 

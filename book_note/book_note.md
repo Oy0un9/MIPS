@@ -327,7 +327,59 @@ rm -f ./qemu
 
 1. 使用以下命令运行`cgi_run.sh`，此时qemu运行hedwig.cgi，并等待gdb连接到端口1234
 ``` 
-sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid=1234&password='+'A'*600"`
+sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid=1234&password='+'A'*0x600"`
 ```
 2. gdb-multiarch调试hedwig.cgi，并在可疑地址`0x409680`处以及调用获取uid的地址`0x409648`处下断。
-3. 
+
+对比`0x409680`指令前后存放$ra的区域，可以看到该内存确实被覆盖了，而且在最后程序返回时也确实可以看到崩溃了。
+但是阅读汇编代码后，发现后面在`0x4096b4`处以写的形式打开了`/var/tmp/temp.xml`文件，对固件目录进行检查时发现，`/var`目录是空的，不存在`/var/tmp/`目录。
+
+由于我没有实体固件路由器，所以无法确定真实环境中是否有该目录，因此只能根据书中的描述来认为该环境中确实存在该目录，并在`/var`目录下创建了`/tmp`目录以尽可能的模拟真实环境。
+
+继续阅读汇编代码，发现并不是只有`0x409680`处调用了`sprintf`函数，在`0x40997C`处也调用了该函数。
+
+再回头去看一遍函数流程，可以得到再`0x409680`处调用了`sprintf`函数形成栈溢出，后续创建`/var/tmp/temp.xml`，如果创建失败的话，程序返回；如果创建成功，会继续执行且在`0x40997C`处再次调用`sprintf`函数再次形成栈溢出。
+
+因此真实环境中，会形成两次栈溢出且栈的最后状态由第二次溢出也就是`0x40997C`处的栈溢出决定，所以一不小心就会造成误判。
+
+漏洞利用的步骤为：
+
+1. 确定缓冲区大小，控制偏移以实现对PC的劫持。
+2. 编写代码，通过qemu虚拟机调试验证。
+3. 确定攻击路径，构造ROP。
+4. 构建利用攻击数据，编写exp。
+
+首先是第一步，缓冲区大小判定，可以使用创建模式字符串去调试确认，但是我都是通过IDA静态分析确定的。在IDA中对缓冲区位置以及存储$ra的地址进行查看，根据公式得到偏移为：
+```C
+offset=saved_ra-buf_addr=-0x4-0x428=0x424
+```
+同时我们知道`sprintf`函数的函数声明是`sprintf(char *str, char *format, ...)`，找到对应的参数第二个参数format是`htdocs/webinc/fatlady.php\nprefix=%s/%s`，第二个参数是`/runtime/session`，第三个参数是我们可控的`cookie`，因此需要达到控制PC的输入长度为：
+```C
+offset=0x424-len("/htdocs/webinc/fatlady.php\nprefix=/runtime/session/")
+offset=0x3f1
+```
+
+第二步，动态确认。在调试之前，首先要创建`/var/tmp/`目录，开始调试时在溢出地址`0x40997C`处以及返回地址`0x409A28`下断。使用命令
+```C
+sudo ./cgi_run.sh  'uid=1234'  `python  -c "print 'uid='+'A'*0x3f2+'B'*0x4"
+```
+来启动程序，并使用gdb-multiarch加载程序进行调试，可以看到在`sprintf`后存储$ra内存区域被覆盖为了0x42424242，即我们已成功控制PC，验证成功。
+
+第三步，确定攻击路径，构造ROP。查看hedwig_main函数返回处的汇编指令，知道了溢出数据可导致$ra、$fp、$s7、$s6、$s5、$s4、$s3、$s2、$s1、$s0等寄存器可控。
+```C
+lw      $ra, 0x4E8+var_4($sp)
+move    $v0, $s7
+lw      $fp, 0x4E8+var_8($sp)
+lw      $s7, 0x4E8+var_C($sp)
+lw      $s6, 0x4E8+var_10($sp)
+lw      $s5, 0x4E8+var_14($sp)
+lw      $s4, 0x4E8+var_18($sp)
+lw      $s3, 0x4E8+var_1C($sp)
+lw      $s2, 0x4E8+var_20($sp)
+lw      $s1, 0x4E8+var_24($sp)
+lw      $s0, 0x4E8+var_28($sp)
+jr      $ra
+```
+构造ROP首先是要找到`system`函数地址，将`libc.so.0`拖进`ida`并搜索函数`system`得到地址偏移为`0x53200`。
+
+找到该函数后，我们需要寻找到可以调用该函数的gadget。这时候`MIPSROP`就派上用场了。

@@ -595,6 +595,14 @@ echo "$INPUT"  | chroot .  ./qemu  -E CONTENT_LENGTH=$LEN -E CONTENT_TYPE="appli
 rm -f ./qemu
 ```
 
+## 第十二章 D-Link DIR-505便携路由器越界漏洞分析
+
+### 漏洞分析
+
+固件下载地址：[ftp://ftp2.dlink.com/PRODUCTS/DIR-505/REVA/DIR-505_FIRMWARE_1.08B10.ZIP](ftp://ftp2.dlink.com/PRODUCTS/DIR-505/REVA/DIR-505_FIRMWARE_1.08B10.ZIP)
+
+漏洞存在于名为“my_cgi.cgi”的cgi脚本中。下载固件，binwalk解压出来，找到该漏洞的核心组件`usr/bin/my_cgi.cgi`
+
 
 
 
